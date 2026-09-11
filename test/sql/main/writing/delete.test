@@ -1,0 +1,153 @@
+# name: test/sql/main/writing/delete.test
+# description: Copy-on-write DELETE for delta tables
+# group: [writing]
+
+require parquet
+
+require delta
+
+require notwindows
+
+statement ok
+ATTACH '{TEMP_DIR}/delta_delete_basic' AS dt (TYPE delta);
+
+statement ok
+CREATE TABLE dt.dt (i INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO dt.dt VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+
+# Delete a subset: the affected file is rewritten with only the surviving rows
+statement ok
+DELETE FROM dt.dt WHERE i % 2 = 0;
+
+query IT
+SELECT * FROM dt.dt ORDER BY i;
+----
+1	a
+3	c
+5	e
+
+# The delete produced a new commit with a remove + add action, re-readable by a fresh scan
+query I
+SELECT count(*) FROM glob('{TEMP_DIR}/delta_delete_basic/_delta_log/*.json');
+----
+3
+
+query I
+SELECT count(*) FROM delta_scan('{TEMP_DIR}/delta_delete_basic');
+----
+3
+
+# Deleting every remaining row removes the file without writing an empty survivor
+statement ok
+DELETE FROM dt.dt WHERE TRUE;
+
+query I
+SELECT count(*) FROM dt.dt;
+----
+0
+
+# -----------------------------------------------------------------------------
+# Multi-file: separate INSERTs create separate data files; a DELETE can span
+# them, rewriting each affected file independently.
+# -----------------------------------------------------------------------------
+
+statement ok
+ATTACH '{TEMP_DIR}/delta_delete_multi' AS dm (TYPE delta);
+
+statement ok
+CREATE TABLE dm.dm (i INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO dm.dm VALUES (1,'a'),(2,'b'),(3,'c');
+
+statement ok
+INSERT INTO dm.dm VALUES (4,'d'),(5,'e'),(6,'f');
+
+query I
+SELECT count(*) FROM dm.dm;
+----
+6
+
+# Delete rows from both files at once
+statement ok
+DELETE FROM dm.dm WHERE i IN (2, 5);
+
+query IT
+SELECT * FROM dm.dm ORDER BY i;
+----
+1	a
+3	c
+4	d
+6	f
+
+# Delete every surviving row of the first file (leaves the second untouched)
+statement ok
+DELETE FROM dm.dm WHERE i <= 3;
+
+query IT
+SELECT * FROM dm.dm ORDER BY i;
+----
+4	d
+6	f
+
+# -----------------------------------------------------------------------------
+# NULLs: rows with NULLs are kept or deleted by predicate like any other
+# -----------------------------------------------------------------------------
+
+statement ok
+ATTACH '{TEMP_DIR}/delta_delete_nulls' AS dn (TYPE delta);
+
+statement ok
+CREATE TABLE dn.dn (i INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO dn.dn VALUES (1,'x'),(2,NULL),(3,'y'),(NULL,'z');
+
+# A non-NULL predicate leaves NULL-bearing rows in place
+statement ok
+DELETE FROM dn.dn WHERE i = 1;
+
+query IT
+SELECT * FROM dn.dn ORDER BY i NULLS LAST;
+----
+2	NULL
+3	y
+NULL	z
+
+# Delete by IS NULL
+statement ok
+DELETE FROM dn.dn WHERE s IS NULL;
+
+query IT
+SELECT * FROM dn.dn ORDER BY i NULLS LAST;
+----
+3	y
+NULL	z
+
+# -----------------------------------------------------------------------------
+# Unsupported shapes are refused with a clear error (copy-on-write cannot yet
+# reconstruct partition directories or column-mapped physical names, and there
+# is no RETURNING support).
+# -----------------------------------------------------------------------------
+
+statement ok
+ATTACH '{TEMP_DIR}/delta_delete_part' AS dp (TYPE delta);
+
+statement ok
+CREATE TABLE dp.dp (i INTEGER, p INTEGER) PARTITIONED BY (p);
+
+# Single partition value: a multi-partition INSERT is a separate, pre-existing limitation (#334)
+statement ok
+INSERT INTO dp.dp VALUES (1, 10), (2, 10);
+
+statement error
+DELETE FROM dp.dp WHERE i = 1;
+----
+<REGEX>:.*partitioned Delta table is not yet supported.*
+
+statement error
+DELETE FROM dt.dt WHERE i = 1 RETURNING *;
+----
+<REGEX>:.*RETURNING clause not yet supported.*

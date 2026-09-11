@@ -36,6 +36,11 @@ public:
 	void BindUpdateConstraints(Binder &binder, LogicalGet &get, LogicalProjection &proj, LogicalUpdate &update,
 	                           ClientContext &context) override;
 
+	//! Row identity for DELETE/UPDATE: the data file and the row's ordinal within it. Delta deletes are
+	//! copy-on-write, so `{filename, file_row_number}` is enough to locate and rewrite the affected files.
+	virtual_column_map_t GetVirtualColumns() const override;
+	vector<column_t> GetRowIdColumns() const override;
+
 	case_insensitive_map_t<vector<NestedNotNullConstraint>> GetNotNullConstraints() const;
 	void ThrowOnUnsupportedFieldForInserting() const;
 

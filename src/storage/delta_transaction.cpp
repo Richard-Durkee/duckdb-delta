@@ -442,7 +442,7 @@ void DeltaTransaction::Commit(ClientContext &context) {
 	if (transaction_state == DeltaTransactionState::TRANSACTION_STARTED) {
 		transaction_state = DeltaTransactionState::TRANSACTION_FINISHED;
 
-		if (!outstanding_appends.empty()) {
+		if (!outstanding_appends.empty() || outstanding_remove_count > 0) {
 			// Finally we add the registered transaction versions
 			for (const auto &app_version : app_versions) {
 				auto app_id = app_version.first;
@@ -617,6 +617,145 @@ void DeltaTransaction::Append(ClientContext &context, const vector<DeltaDataFile
 	}
 }
 
+void DeltaTransaction::SetOperationOnce(const string &operation) {
+	D_ASSERT(transaction_state == DeltaTransactionState::TRANSACTION_STARTED);
+	// A file-level change is always a data change; record it before committing.
+	ffi::set_data_change(kernel_transaction.get(), true);
+	if (operation_set) {
+		return;
+	}
+	// with_operation consumes the transaction handle and returns a new one.
+	kernel_transaction = table_entry->snapshot->TryUnpackKernelResult(ffi::with_operation(
+	    kernel_transaction.release(), KernelUtils::ToDeltaString(operation), table_entry->snapshot->extern_engine.get()));
+	operation_set = true;
+}
+
+//! Percent-decode a URI path segment. Kept in sync with the identically-named helper in
+//! delta_multi_file_list.cpp (both decode the kernel's URI-encoded Add paths); the two are small and
+//! file-local, so they are duplicated rather than shared.
+static string url_decode(string input) {
+	string result;
+	result.reserve(input.size());
+	for (idx_t i = 0; i < input.length(); i++) {
+		if (int(input[i]) == 37) {
+			unsigned int ii;
+			sscanf(input.substr(i + 1, 2).c_str(), "%x", &ii);
+			result += static_cast<char>(ii);
+			i += 2;
+		} else {
+			result += input[i];
+		}
+	}
+	return result;
+}
+
+//! Resolve a kernel-relative, URI-encoded scan path to the absolute DuckDB path the delete operator
+//! collected from the scan's `filename` virtual column. Mirrors ScanDataCallBack::VisitCallbackInternal.
+static string ResolveKernelPathToDuckDB(const string &table_root, const string &raw_path) {
+	string path_string = table_root;
+	if (StringUtil::StartsWith(raw_path, "/") && raw_path.find('/', 1) != std::string::npos) {
+		path_string = raw_path;
+	} else {
+		StringUtil::RTrim(path_string, "/");
+		path_string += "/" + raw_path;
+	}
+	path_string = url_decode(path_string);
+	return DeltaMultiFileList::ToDuckDBPath(path_string);
+}
+
+void DeltaTransaction::RemoveFiles(ClientContext &context, const unordered_set<string> &files_to_remove,
+                                   const string &operation) {
+	if (files_to_remove.empty()) {
+		return;
+	}
+	if (transaction_state == DeltaTransactionState::TRANSACTION_NOT_YET_STARTED) {
+		InitializeTransaction(context);
+	}
+	SetOperationOnce(operation);
+
+	auto &snapshot = *table_entry->snapshot;
+	auto engine = snapshot.extern_engine.get();
+	auto table_root = snapshot.GetPath();
+
+	// Build a fresh, unfiltered scan of the snapshot so we can recover the scan-metadata engine data
+	// batches (one row per Add file) that `ffi::remove_files` needs, together with a selection vector.
+	KernelScan scan;
+	KernelScanDataIterator scan_iterator;
+	{
+		auto snapshot_ref = snapshot.snapshot->GetLockingRef();
+		scan = snapshot.TryUnpackKernelResult(ffi::scan(snapshot_ref.GetPtr(), engine, nullptr, nullptr));
+	}
+	scan_iterator = snapshot.TryUnpackKernelResult(ffi::scan_metadata_iter_init(engine, scan.get()));
+
+	idx_t removed = 0;
+	while (true) {
+		// Returns the next scan-metadata batch as Arrow, or a null pointer once the iterator is exhausted.
+		auto arrow_result = snapshot.TryUnpackKernelResult(ffi::scan_metadata_next_arrow(scan_iterator.get(), engine));
+		if (!arrow_result) {
+			break;
+		}
+
+		// The scan-row schema is a struct whose first top-level field is `path` (STRING); each row is one
+		// Add file. Read that column and select the rows whose resolved path is in `files_to_remove`.
+		auto &arrow_array = *reinterpret_cast<ArrowArray *>(&arrow_result->arrow_data.array);
+		idx_t row_count = NumericCast<idx_t>(arrow_array.length);
+		D_ASSERT(arrow_array.n_children >= 1);
+		auto &path_child = *arrow_array.children[0];
+		auto path_offsets = reinterpret_cast<const int32_t *>(path_child.buffers[1]);
+		auto path_data = reinterpret_cast<const char *>(path_child.buffers[2]);
+		auto child_offset = NumericCast<idx_t>(path_child.offset);
+
+		// The kernel's own selection vector marks which rows (files) are active in this scan. Selecting a
+		// row that was not active would stage an invalid Remove, so intersect with it (empty = all active).
+		auto &scan_sv = arrow_result->selection_vector;
+
+		vector<uint8_t> selection_vector(row_count, 0);
+		bool any_selected = false;
+		for (idx_t r = 0; r < row_count; r++) {
+			bool active = (scan_sv.ptr == nullptr || scan_sv.len == 0) ? true : scan_sv.ptr[r];
+			if (!active) {
+				continue;
+			}
+			auto o = child_offset + r;
+			auto begin = path_offsets[o];
+			auto end = path_offsets[o + 1];
+			string raw_path(path_data + begin, NumericCast<idx_t>(end - begin));
+			auto resolved = ResolveKernelPathToDuckDB(table_root, raw_path);
+			if (files_to_remove.count(resolved)) {
+				selection_vector[r] = 1;
+				any_selected = true;
+				removed++;
+			}
+		}
+
+		// Convert the arrow batch back into kernel engine data and stage the Remove actions. get_engine_data
+		// takes the FFI_ArrowArray by value and imports (takes ownership of) its buffers; null the release
+		// callback on the copy still held by arrow_result so free_scan_metadata_arrow_result below does not
+		// release the same buffers a second time (which would corrupt the data the kernel filters at commit).
+		KernelEngineData engine_data = snapshot.TryUnpackKernelResult(ffi::get_engine_data(
+		    arrow_result->arrow_data.array, &arrow_result->arrow_data.schema, DuckDBEngineError::AllocateError));
+		arrow_array.release = nullptr;
+		if (any_selected) {
+			bool remove_ok = false;
+			auto res = KernelUtils::TryUnpackResult(
+			    ffi::remove_files(kernel_transaction.get(), engine_data.release(), selection_vector.data(),
+			                      selection_vector.size(), engine),
+			    remove_ok);
+			if (res.HasError()) {
+				res.Throw();
+			}
+		}
+		ffi::free_scan_metadata_arrow_result(arrow_result);
+	}
+
+	if (removed < files_to_remove.size()) {
+		throw InternalException("DeltaTransaction::RemoveFiles: %llu of %llu files to remove were not found in the "
+		                        "current snapshot",
+		                        files_to_remove.size() - removed, files_to_remove.size());
+	}
+	outstanding_remove_count += removed;
+}
+
 void DeltaTransaction::SetTransactionVersion(const string &app_id_p, idx_t new_version_p, Value expected_version_p) {
 	app_versions.insert({app_id_p, {new_version_p, std::move(expected_version_p)}});
 }
@@ -632,6 +771,11 @@ AccessMode DeltaTransaction::GetAccessMode() const {
 bool DeltaTransaction::HasOutstandingAppends() const {
 	unique_lock<mutex> lck(lock);
 	return !outstanding_appends.empty();
+}
+
+bool DeltaTransaction::HasOutstandingWrites() const {
+	unique_lock<mutex> lck(lock);
+	return !outstanding_appends.empty() || outstanding_remove_count > 0;
 }
 
 optional_ptr<DeltaTableEntry> DeltaTransaction::GetTableEntry(idx_t version) {

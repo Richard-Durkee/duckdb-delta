@@ -10,6 +10,10 @@
 #include "duckdb/common/types/timestamp.hpp"
 
 #include "functions/delta_scan/delta_multi_file_list.hpp"
+#include "storage/delta_delete.hpp"
+#include "storage/delta_table_entry.hpp"
+#include "duckdb/planner/operator/logical_delete.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 
 namespace duckdb {
 
@@ -168,7 +172,54 @@ PhysicalOperator &DeltaCatalog::PlanCreateTableAs(ClientContext &context, Physic
 }
 PhysicalOperator &DeltaCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
                                            PhysicalOperator &plan) {
-	throw NotImplementedException("DeltaCatalog PlanDelete");
+	if (op.return_chunk) {
+		throw BinderException("RETURNING clause not yet supported for deletion from a Delta table");
+	}
+
+	auto &table = op.table.Cast<DeltaTableEntry>();
+
+	// Copy-on-write DELETE rewrites surviving rows through delta_scan and the parquet writer under their
+	// logical names. That path does not yet reconstruct partition directories or column-mapped physical
+	// names, so restrict the first implementation to the plain case and refuse the rest with a clear error
+	// rather than write a table the reference readers would misinterpret.
+	if (!table.snapshot->GetPartitionColumns().empty()) {
+		throw NotImplementedException("DELETE from a partitioned Delta table is not yet supported");
+	}
+	for (auto &col : table.snapshot->GetLazyLoadedGlobalColumns()) {
+		if (!col.physical_name.empty() || col.field_id.IsValid()) {
+			throw NotImplementedException("DELETE from a Delta table that uses column mapping is not yet supported");
+		}
+	}
+
+	// Copy-on-write rewrites whole files under the assumption that a file's rows are exactly its live
+	// Parquet rows. Deletion vectors break that (some rows are already logically deleted), and Change
+	// Data Feed additionally requires writing `_change_data` records this path does not produce. Refuse
+	// both rather than silently corrupt the table or drop the change feed.
+	auto properties = table.snapshot->GetTableProperties();
+	auto is_enabled = [&](const string &key) {
+		auto entry = properties.find(key);
+		return entry != properties.end() && StringUtil::CIEquals(entry->second, "true");
+	};
+	if (is_enabled("delta.enableDeletionVectors")) {
+		throw NotImplementedException("DELETE from a Delta table with deletion vectors enabled is not yet supported");
+	}
+	if (is_enabled("delta.enableChangeDataFeed")) {
+		throw NotImplementedException("DELETE from a Delta table with Change Data Feed enabled is not yet supported");
+	}
+
+	// The row-id columns advertised by DeltaTableEntry::GetRowIdColumns() are {filename, file_row_number},
+	// in that order, and appear as the leading bound references in op.expressions.
+	if (op.expressions.size() < 2) {
+		throw InternalException("DeltaCatalog::PlanDelete expected 2 row-id expressions, found %llu",
+		                        op.expressions.size());
+	}
+	vector<idx_t> row_id_indexes;
+	for (idx_t i = 0; i < 2; i++) {
+		auto &bound_ref = op.expressions[i]->Cast<BoundReferenceExpression>();
+		row_id_indexes.push_back(bound_ref.Index());
+	}
+
+	return DeltaDelete::PlanDelete(context, planner, table, plan, std::move(row_id_indexes));
 }
 PhysicalOperator &DeltaCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
                                            PhysicalOperator &plan) {

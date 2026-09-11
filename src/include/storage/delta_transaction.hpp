@@ -10,6 +10,7 @@
 
 #include "delta_utils.hpp"
 #include "duckdb/transaction/transaction.hpp"
+#include "duckdb/common/unordered_set.hpp"
 
 namespace duckdb {
 class DeltaCatalog;
@@ -33,12 +34,20 @@ public:
 
 	void Append(ClientContext &context, const vector<DeltaDataFile> &append_files);
 
+	//! Stage Remove actions for the given data files (paths as the kernel records them, i.e. relative to
+	//! the table root). Drives the kernel scan to recover the scan-metadata engine data, selects the rows
+	//! matching `files_to_remove`, and applies them to the transaction via `ffi::remove_files`. `operation`
+	//! is the history operation name recorded in the commit (e.g. "DELETE", "UPDATE", "MERGE").
+	void RemoveFiles(ClientContext &context, const unordered_set<string> &files_to_remove, const string &operation);
+
 	void SetTransactionVersion(const string &app_id, idx_t new_version, Value expected_value);
 
 	static DeltaTransaction &Get(ClientContext &context, Catalog &catalog);
 	AccessMode GetAccessMode() const;
 
 	bool HasOutstandingAppends() const;
+	//! True when this transaction has staged any uncommitted write (append or remove)
+	bool HasOutstandingWrites() const;
 
 	optional_ptr<DeltaTableEntry> GetTableEntry(idx_t version);
 
@@ -61,6 +70,10 @@ public:
 
 protected:
 	void InitializeTransaction(ClientContext &context);
+	//! Records the operation name (once per transaction) and marks the transaction as changing data.
+	//! `ffi::with_operation` consumes and returns the transaction handle, so this must run after
+	//! InitializeTransaction and is guarded to run at most once.
+	void SetOperationOnce(const string &operation);
 
 private:
 	mutable mutex lock;
@@ -79,6 +92,14 @@ private:
 	const AccessMode access_mode;
 
 	vector<DeltaDataFile> outstanding_appends;
+
+	//! Number of Remove actions staged on the kernel transaction this session. Removes are applied to the
+	//! kernel transaction eagerly (like appends), so this only needs to gate commit and the uncommitted-write
+	//! check; the file list itself lives in the kernel transaction.
+	idx_t outstanding_remove_count = 0;
+
+	//! Whether `ffi::with_operation` has already been called on this transaction (it consumes the handle)
+	bool operation_set = false;
 
 	KernelExclusiveTransaction kernel_transaction;
 

@@ -22,6 +22,8 @@
 
 namespace duckdb {
 
+class TableCatalogEntry;
+
 //! Builds a kernel engine for a table path, applying the DuckDB secret matching that path. Callable
 //! before any snapshot exists, which is what the CREATE TABLE path needs.
 KernelExternEngine CreateDeltaEngine(ClientContext &context, const string &path);
@@ -117,6 +119,16 @@ public:
 	static string ToDuckDBPath(const string &raw_path);
 	static string ToDeltaPath(const string &raw_path);
 
+	//! The catalog table entry this snapshot belongs to, when the list backs a catalog table scan (as
+	//! opposed to a standalone delta_scan('path')). Lets the scan report a base table to the binder so
+	//! DELETE/UPDATE can target it. Null for standalone scans.
+	optional_ptr<TableCatalogEntry> GetTable() const {
+		return table_entry;
+	}
+	void SetTable(TableCatalogEntry &entry) {
+		table_entry = &entry;
+	}
+
 	//! MultiFileList API
 public:
 	void Bind(vector<LogicalType> &return_types, vector<Identifier> &names);
@@ -142,6 +154,9 @@ public:
 	//! reusing the previous snapshot when this list was given one.
 	idx_t ResolveTimestampToVersion(timestamp_tz_t timestamp) const;
 	vector<string> GetPartitionColumns();
+	//! The table's Delta configuration properties (the `configuration` map of the Metadata action), e.g.
+	//! `delta.enableDeletionVectors` / `delta.enableChangeDataFeed`. Keys are matched case-insensitively.
+	case_insensitive_map_t<string> GetTableProperties() const;
 
 	vector<DeltaMultiFileColumnDefinition> &GetLazyLoadedGlobalColumns() const;
 	vector<NestedNotNullConstraint> GetNestedNotNullConstraints() const;
@@ -188,6 +203,9 @@ public: // TODO: clean up
 
 	mutable KernelExternEngine extern_engine;
 	mutable shared_ptr<SharedKernelSnapshot> snapshot;
+
+	//! Set when this list backs a catalog table scan; see GetTable().
+	optional_ptr<TableCatalogEntry> table_entry;
 
 	mutable unique_ptr<DeltaLogPathArray> delta_log_path;
 	mutable int64_t max_catalog_version = -1;

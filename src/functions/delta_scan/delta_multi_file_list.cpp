@@ -1020,6 +1020,24 @@ void DeltaMultiFileList::EnsureSnapshotInitialized() const {
 	}
 }
 
+struct KernelConfigVisitorData {
+	case_insensitive_map_t<string> properties;
+};
+
+static void KernelConfigVisitor(ffi::NullableCvoid engine_context, ffi::KernelStringSlice key,
+                                ffi::KernelStringSlice value) {
+	auto data = static_cast<KernelConfigVisitorData *>(engine_context);
+	data->properties[KernelUtils::FromDeltaString(key)] = KernelUtils::FromDeltaString(value);
+}
+
+case_insensitive_map_t<string> DeltaMultiFileList::GetTableProperties() const {
+	EnsureSnapshotInitialized();
+	auto snapshot_ref = snapshot->GetLockingRef();
+	KernelConfigVisitorData data;
+	ffi::visit_metadata_configuration(snapshot_ref.GetPtr(), &data, KernelConfigVisitor);
+	return std::move(data.properties);
+}
+
 void DeltaMultiFileList::EnsureScanInitialized() const {
 	EnsureSnapshotInitialized();
 	if (!initialized_scan) {

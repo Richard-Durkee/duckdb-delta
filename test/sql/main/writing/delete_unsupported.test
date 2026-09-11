@@ -1,0 +1,29 @@
+# name: test/sql/main/writing/delete_unsupported.test
+# description: DELETE is refused on Delta tables whose features copy-on-write cannot handle yet
+# group: [writing]
+
+require parquet
+
+require delta
+
+require notwindows
+
+require-env DAT_PATH
+
+# Deletion vectors: some rows are already logically deleted, so a whole-file rewrite would be wrong.
+statement ok
+ATTACH '{DAT_PATH}/out/reader_tests/generated/deletion_vectors/delta' AS dv (TYPE delta);
+
+statement error
+DELETE FROM dv.dv WHERE 1=1;
+----
+<REGEX>:.*deletion vectors enabled is not yet supported.*
+
+# Change Data Feed: a DELETE must also write `_change_data` records, which this path does not produce.
+statement ok
+ATTACH '{DAT_PATH}/out/reader_tests/generated/cdf/delta' AS cdf (TYPE delta);
+
+statement error
+DELETE FROM cdf.cdf WHERE 1=1;
+----
+<REGEX>:.*Change Data Feed enabled is not yet supported.*

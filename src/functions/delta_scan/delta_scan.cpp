@@ -71,6 +71,18 @@ virtual_column_map_t DeltaVirtualColumns(ClientContext &, optional_ptr<FunctionD
 	return result;
 }
 
+//! Report the base table backing a catalog table scan, so the binder allows DELETE/UPDATE to target it.
+//! Standalone delta_scan('path') calls have no table entry and are reported as an external scan.
+static BindInfo DeltaBindInfo(const optional_ptr<FunctionData> bind_data) {
+	auto &multi_file_data = bind_data->Cast<MultiFileBindData>();
+	auto &file_list = multi_file_data.file_list->Cast<DeltaMultiFileList>();
+	auto table = file_list.GetTable();
+	if (!table) {
+		return BindInfo(ScanType::EXTERNAL);
+	}
+	return BindInfo(*table);
+}
+
 static void DeltaScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
                                const TableFunction &function) {
 	throw NotImplementedException("DeltaScan serialization not implemented");
@@ -100,7 +112,7 @@ TableFunctionSet DeltaFunctions::GetDeltaScanFunction(ExtensionLoader &loader) {
 		function.deserialize = DeltaScanDeserialize;
 		function.statistics = nullptr;
 		function.table_scan_progress = nullptr;
-		function.get_bind_info = nullptr;
+		function.get_bind_info = DeltaBindInfo;
 		function.get_virtual_columns = DeltaVirtualColumns;
 		function.supports_pushdown_extract = nullptr;
 		function.late_materialization = false;

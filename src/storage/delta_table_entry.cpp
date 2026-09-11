@@ -10,9 +10,26 @@
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
+#include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "functions/delta_scan/delta_multi_file_list.hpp"
 
 namespace duckdb {
+
+virtual_column_map_t DeltaTableEntry::GetVirtualColumns() const {
+	virtual_column_map_t result;
+	result.insert(make_pair(COLUMN_IDENTIFIER_ROW_ID, TableColumn("rowid", LogicalType::ROW_TYPE)));
+	result.insert(make_pair(MultiFileReader::COLUMN_IDENTIFIER_FILENAME, TableColumn("filename", LogicalType::VARCHAR)));
+	result.insert(make_pair(MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER,
+	                        TableColumn("file_row_number", LogicalType::BIGINT)));
+	return result;
+}
+
+vector<column_t> DeltaTableEntry::GetRowIdColumns() const {
+	vector<column_t> result;
+	result.push_back(MultiFileReader::COLUMN_IDENTIFIER_FILENAME);
+	result.push_back(MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER);
+	return result;
+}
 
 DeltaTableEntry::DeltaTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info)
     : TableCatalogEntry(catalog, schema, info), columns(std::move(info.columns)) {
@@ -52,7 +69,7 @@ TableFunction DeltaTableEntry::GetScanFunctionInternal(ClientContext &context, u
 	auto &delta_catalog = catalog.Cast<DeltaCatalog>();
 
 	auto &transaction = DeltaTransaction::Get(context, delta_catalog);
-	if (transaction.HasOutstandingAppends()) {
+	if (transaction.HasOutstandingWrites()) {
 		throw CatalogException("Scanning a table with uncommitted writes is not supported");
 	}
 
@@ -73,6 +90,9 @@ TableFunction DeltaTableEntry::GetScanFunctionInternal(ClientContext &context, u
 
 	function_info->snapshot = this->snapshot;
 	function_info->table_name = delta_catalog.GetName().GetIdentifierName();
+	// Let the scan report this base table to the binder (via delta_scan's get_bind_info), so DELETE/UPDATE
+	// can resolve their target table. The snapshot is owned by this entry, so the back-pointer is safe.
+	this->snapshot->SetTable(*this);
 	delta_scan_function.function_info = std::move(function_info);
 
 	vector<Value> inputs = {delta_catalog.GetDBPath()};
