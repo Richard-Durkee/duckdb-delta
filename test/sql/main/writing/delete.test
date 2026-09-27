@@ -127,6 +127,35 @@ SELECT * FROM dn.dn ORDER BY i NULLS LAST;
 NULL	z
 
 # -----------------------------------------------------------------------------
+# Rewritten files carry column stats, and bulk deletes stay correct
+# -----------------------------------------------------------------------------
+
+statement ok
+ATTACH '{TEMP_DIR}/delta_delete_stats' AS ds (TYPE delta);
+
+statement ok
+CREATE TABLE ds.ds (i INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO ds.ds SELECT i, 'r' || i FROM range(0, 100000) t(i);
+
+statement ok
+DELETE FROM ds.ds WHERE i < 90000;
+
+query III
+SELECT count(*), min(i), max(i) FROM ds.ds;
+----
+10000	90000	99999
+
+# The survivor Add action records numRecords and min/max stats like an INSERT does
+query I
+SELECT content LIKE '%"add"%' AND content LIKE '%numRecords%' AND content LIKE '%minValues%'
+    AND content LIKE '%maxValues%'
+FROM read_text('{TEMP_DIR}/delta_delete_stats/_delta_log/00000000000000000002.json');
+----
+true
+
+# -----------------------------------------------------------------------------
 # Unsupported shapes are refused with a clear error (copy-on-write cannot yet
 # reconstruct partition directories or column-mapped physical names, and there
 # is no RETURNING support).

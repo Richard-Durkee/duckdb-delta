@@ -12,17 +12,16 @@
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
-#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/main/database.hpp"
 
 namespace duckdb {
 
-DeltaDelete::DeltaDelete(PhysicalPlan &physical_plan, DeltaTableEntry &table,
-                         optional_ptr<DeltaMultiFileList> multi_file_list, PhysicalOperator &child,
+DeltaDelete::DeltaDelete(PhysicalPlan &physical_plan, DeltaTableEntry &table, PhysicalOperator &child,
                          vector<idx_t> row_id_indexes_p)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, {LogicalType::BIGINT}, 1), table(table),
-      multi_file_list(multi_file_list), row_id_indexes(std::move(row_id_indexes_p)) {
+      row_id_indexes(std::move(row_id_indexes_p)) {
 	children.push_back(child);
 }
 
@@ -106,8 +105,12 @@ SinkFinalizeType DeltaDelete::Finalize(Pipeline &pipeline, Event &event, ClientC
 	// Copy-on-write: for each affected file, rewrite the rows that survive the delete into a new data
 	// file (read back through delta_scan so column values match the logical schema) and stage it as an
 	// Add; the original file is staged as a Remove. Both are committed together by the DeltaTransaction.
+	// The scan is pinned to this transaction's snapshot version, and the deleted positions are bound as a
+	// LIST parameter and anti-joined, so large deletes don't have to parse a huge SQL literal.
 	// Every survivor file we write is tracked so it can be cleaned up if any step fails before commit,
 	// rather than leaving orphaned parquet files in the table directory.
+	auto table_version = table.snapshot->GetVersion();
+	auto columns = table.snapshot->GetLazyLoadedGlobalColumns();
 	vector<string> written_files;
 	Connection con(*context.db);
 	try {
@@ -117,45 +120,51 @@ SinkFinalizeType DeltaDelete::Finalize(Pipeline &pipeline, Event &event, ClientC
 			files_to_remove.insert(file_name);
 			total_deleted += positions.size();
 
-			// Build the NOT IN list of physical row numbers to drop from this file.
-			string pos_list;
-			for (auto pos : positions) {
-				if (!pos_list.empty()) {
-					pos_list += ",";
-				}
-				pos_list += to_string(pos);
-			}
-
 			auto new_file = Path::FromString(table_path)
 			                    .Join("duckdb-" + UUID::ToString(UUID::GenerateRandomUUID()) + ".parquet")
 			                    .ToString();
 			written_files.push_back(new_file);
 
-			string sql = "COPY (SELECT * FROM delta_scan(" + SQLString(table_path) + ") WHERE filename = " +
-			             SQLString(file_name) + " AND file_row_number NOT IN (" + pos_list + ")) TO " +
-			             SQLString(new_file) + " (FORMAT PARQUET)";
+			string sql = "COPY (SELECT d.* EXCLUDE (file_row_number) FROM (SELECT *, file_row_number FROM delta_scan(" +
+			             SQLString(table_path) + ", version => " + to_string(table_version) +
+			             ") WHERE filename = $1) d ANTI JOIN (SELECT unnest($2::BIGINT[]) AS pos) p ON "
+			             "d.file_row_number = p.pos) TO " +
+			             SQLString(new_file) + " (FORMAT PARQUET, RETURN_STATS true)";
 
-			auto result = con.Query(sql);
+			vector<Value> deleted_positions;
+			deleted_positions.reserve(positions.size());
+			for (auto pos : positions) {
+				deleted_positions.push_back(Value::BIGINT(NumericCast<int64_t>(pos)));
+			}
+			vector<Value> parameters {Value(file_name), Value::LIST(LogicalType::BIGINT, std::move(deleted_positions))};
+
+			auto prepared = con.Prepare(sql);
+			if (prepared->HasError()) {
+				prepared->GetErrorObject().Throw();
+			}
+			auto result = prepared->Execute(parameters, false);
 			if (result->HasError()) {
 				result->ThrowError();
 			}
-			auto survivor_count = result->GetValue(0, 0).GetValue<idx_t>();
+			auto &stats = result->Cast<MaterializedQueryResult>();
+			if (stats.RowCount() != 1) {
+				throw InternalException("DeltaDelete: expected one written file from the survivor COPY, found %llu",
+				                        stats.RowCount());
+			}
 
-			if (survivor_count == 0) {
+			DeltaDataFile data_file;
+			data_file.file_name = new_file;
+			data_file.row_count = stats.GetValue(1, 0).GetValue<idx_t>();
+			if (data_file.row_count == 0) {
 				// Every row of this file was deleted: no survivors to write, just remove the original. COPY
 				// still wrote an empty file, so clean it up.
 				fs.TryRemoveFile(new_file);
 				continue;
 			}
-
-			DeltaDataFile data_file;
-			data_file.file_name = new_file;
-			data_file.row_count = survivor_count;
-			data_file.footer_size = 0;
-			{
-				auto handle = fs.OpenFile(new_file, FileOpenFlags::FILE_FLAGS_READ);
-				data_file.file_size_bytes = NumericCast<idx_t>(fs.GetFileSize(*handle));
-			}
+			data_file.file_size_bytes = stats.GetValue(2, 0).GetValue<idx_t>();
+			data_file.footer_size = stats.GetValue(3, 0).GetValue<idx_t>();
+			// Survivors already satisfied the table's NOT NULL constraints, so they need no re-check.
+			ParseWrittenColumnStats(stats.GetValue(4, 0), columns, table.name.GetIdentifierName(), nullptr, data_file);
 			new_files.push_back(std::move(data_file));
 		}
 
@@ -189,49 +198,10 @@ SourceResultType DeltaDelete::GetDataInternal(ExecutionContext &context, DataChu
 //===--------------------------------------------------------------------===//
 // Plan
 //===--------------------------------------------------------------------===//
-static bool ScanEmitsRowId(const PhysicalTableScan &scan) {
-	if (scan.function.GetName() != "delta_scan") {
-		return false;
-	}
-	bool has_file_name = false;
-	bool has_file_row_number = false;
-	for (auto &column : scan.column_ids) {
-		if (!column.HasPrimaryIndex()) {
-			continue;
-		}
-		auto index = column.GetPrimaryIndex();
-		if (index == MultiFileReader::COLUMN_IDENTIFIER_FILENAME) {
-			has_file_name = true;
-		} else if (index == MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER) {
-			has_file_row_number = true;
-		}
-	}
-	return has_file_name && has_file_row_number;
-}
-
-optional_ptr<PhysicalTableScan> DeltaDelete::FindDeltaScan(PhysicalOperator &plan) {
-	if (plan.type == PhysicalOperatorType::TABLE_SCAN) {
-		auto &scan = plan.Cast<PhysicalTableScan>();
-		return ScanEmitsRowId(scan) ? &scan : nullptr;
-	}
-	for (auto &child : plan.children) {
-		auto result = FindDeltaScan(child.get());
-		if (result) {
-			return result;
-		}
-	}
-	return nullptr;
-}
-
-PhysicalOperator &DeltaDelete::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, DeltaTableEntry &table,
-                                          PhysicalOperator &child_plan, vector<idx_t> &&row_id_indexes) {
-	auto scan = FindDeltaScan(child_plan);
-	optional_ptr<DeltaMultiFileList> multi_file_list;
-	if (scan) {
-		auto &bind_data = scan->bind_data->Cast<MultiFileBindData>();
-		multi_file_list = bind_data.file_list->Cast<DeltaMultiFileList>();
-	}
-	return planner.Make<DeltaDelete>(table, multi_file_list, child_plan, std::move(row_id_indexes));
+PhysicalOperator &DeltaDelete::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,
+                                          DeltaTableEntry &table, PhysicalOperator &child_plan,
+                                          vector<idx_t> &&row_id_indexes) {
+	return planner.Make<DeltaDelete>(table, child_plan, std::move(row_id_indexes));
 }
 
 //===--------------------------------------------------------------------===//

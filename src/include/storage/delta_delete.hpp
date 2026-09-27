@@ -16,8 +16,6 @@
 namespace duckdb {
 
 class DeltaTableEntry;
-class DeltaMultiFileList;
-class PhysicalTableScan;
 
 //! Per-thread accumulation of the positions to delete, grouped by the data file they belong to.
 class DeltaDeleteLocalState : public LocalSinkState {
@@ -51,13 +49,11 @@ public:
 //! DeltaTransaction so they commit atomically.
 class DeltaDelete : public PhysicalOperator {
 public:
-	DeltaDelete(PhysicalPlan &physical_plan, DeltaTableEntry &table, optional_ptr<DeltaMultiFileList> multi_file_list,
-	            PhysicalOperator &child, vector<idx_t> row_id_indexes);
+	DeltaDelete(PhysicalPlan &physical_plan, DeltaTableEntry &table, PhysicalOperator &child,
+	            vector<idx_t> row_id_indexes);
 
 	//! The table to delete from
 	DeltaTableEntry &table;
-	//! The file list of the delta scan feeding this delete (may be null if the scan was optimized away)
-	optional_ptr<DeltaMultiFileList> multi_file_list;
 	//! Indexes, within the incoming chunk, of the {filename, file_row_number} row-id columns
 	vector<idx_t> row_id_indexes;
 
@@ -90,10 +86,6 @@ public:
 
 	string GetName() const override;
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
-
-private:
-	//! Walk `plan` for the delta_scan that emits the {filename, file_row_number} row-id virtual columns.
-	static optional_ptr<PhysicalTableScan> FindDeltaScan(PhysicalOperator &plan);
 };
 
 } // namespace duckdb

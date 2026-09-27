@@ -18,7 +18,8 @@ namespace duckdb {
 virtual_column_map_t DeltaTableEntry::GetVirtualColumns() const {
 	virtual_column_map_t result;
 	result.insert(make_pair(COLUMN_IDENTIFIER_ROW_ID, TableColumn("rowid", LogicalType::ROW_TYPE)));
-	result.insert(make_pair(MultiFileReader::COLUMN_IDENTIFIER_FILENAME, TableColumn("filename", LogicalType::VARCHAR)));
+	result.insert(
+	    make_pair(MultiFileReader::COLUMN_IDENTIFIER_FILENAME, TableColumn("filename", LogicalType::VARCHAR)));
 	result.insert(make_pair(MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER,
 	                        TableColumn("file_row_number", LogicalType::BIGINT)));
 	return result;

@@ -111,4 +111,13 @@ struct DeltaDataFile {
 	vector<pair<vector<string>, DeltaColumnStats>> column_stats;
 };
 
+class NestedNotNullConstraint;
+
+//! Parse the `column_statistics` returned by a parquet COPY into `data_file.column_stats`, throwing if a column
+//! reporting NULLs violates one of `not_null_constraints` (when given).
+void ParseWrittenColumnStats(
+    const Value &column_statistics, const vector<DeltaMultiFileColumnDefinition> &columns, const string &table_name,
+    optional_ptr<const case_insensitive_map_t<vector<NestedNotNullConstraint>>> not_null_constraints,
+    DeltaDataFile &data_file);
+
 } // namespace duckdb

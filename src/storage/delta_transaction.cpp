@@ -625,8 +625,9 @@ void DeltaTransaction::SetOperationOnce(const string &operation) {
 		return;
 	}
 	// with_operation consumes the transaction handle and returns a new one.
-	kernel_transaction = table_entry->snapshot->TryUnpackKernelResult(ffi::with_operation(
-	    kernel_transaction.release(), KernelUtils::ToDeltaString(operation), table_entry->snapshot->extern_engine.get()));
+	kernel_transaction = table_entry->snapshot->TryUnpackKernelResult(
+	    ffi::with_operation(kernel_transaction.release(), KernelUtils::ToDeltaString(operation),
+	                        table_entry->snapshot->extern_engine.get()));
 	operation_set = true;
 }
 
@@ -737,10 +738,10 @@ void DeltaTransaction::RemoveFiles(ClientContext &context, const unordered_set<s
 		arrow_array.release = nullptr;
 		if (any_selected) {
 			bool remove_ok = false;
-			auto res = KernelUtils::TryUnpackResult(
-			    ffi::remove_files(kernel_transaction.get(), engine_data.release(), selection_vector.data(),
-			                      selection_vector.size(), engine),
-			    remove_ok);
+			auto res = KernelUtils::TryUnpackResult(ffi::remove_files(kernel_transaction.get(), engine_data.release(),
+			                                                          selection_vector.data(), selection_vector.size(),
+			                                                          engine),
+			                                        remove_ok);
 			if (res.HasError()) {
 				res.Throw();
 			}

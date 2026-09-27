@@ -156,6 +156,70 @@ static DeltaColumnStats ParseColumnStats(const vector<Value> col_stats) {
 	return column_stats;
 }
 
+void ParseWrittenColumnStats(
+    const Value &column_statistics, const vector<DeltaMultiFileColumnDefinition> &columns, const string &table_name,
+    optional_ptr<const case_insensitive_map_t<vector<NestedNotNullConstraint>>> not_null_constraints,
+    DeltaDataFile &data_file) {
+	auto &map_children = MapValue::GetChildren(column_statistics);
+	for (idx_t col_idx = 0; col_idx < map_children.size(); col_idx++) {
+		auto &struct_children = StructValue::GetChildren(map_children[col_idx]);
+		auto &col_name = StringValue::Get(struct_children[0]);
+		auto &col_stats = MapValue::GetChildren(struct_children[1]);
+		auto column_names = ParseQuotedList(col_name, '.');
+		auto stats = ParseColumnStats(col_stats);
+
+		// The copy reports stats under the names it was given, which on a column-mapped table are the
+		// physical ones -- and that is also how the log wants them keyed, so they pass through untouched.
+		// Constraints and messages resolve on the logical name, which would otherwise miss silently and
+		// stop enforcing the constraint.
+		bool found = false;
+		LogicalType coltype;
+		string logical_name;
+		for (auto &col : columns) {
+			const auto &written_name = col.physical_name.empty() ? col.name.GetIdentifierName() : col.physical_name;
+			if (written_name == column_names[0]) {
+				found = true;
+				coltype = col.type;
+				logical_name = col.name.GetIdentifierName();
+				break;
+			}
+		}
+		if (!found) {
+			throw InternalException("Column %s not found in table %s", StringUtil::Join(column_names, "."), table_name);
+		}
+
+		if (not_null_constraints && stats.has_null_count && stats.null_count > 0) {
+			auto constraint = not_null_constraints->find(logical_name);
+			if (constraint != not_null_constraints->end()) {
+				// We may have a not null constraint for this col, it's not nested so it
+				if (column_names.size() == 1) {
+					throw ConstraintException("NOT NULL constraint failed: %s.%s", table_name, logical_name);
+				}
+
+				// Check paths
+				for (auto &constr : constraint->second) {
+					if (col_name == constr.path) {
+						auto logical_path = column_names;
+						logical_path[0] = logical_name;
+						throw ConstraintException("NOT NULL constraint failed: %s.%s", table_name,
+						                          StringUtil::Join(logical_path, "."));
+					}
+				}
+			}
+		}
+
+		// Skip types whose stats we don't yet support
+		if (coltype.id() == LogicalTypeId::VARIANT || coltype.id() == LogicalTypeId::LIST) {
+			continue;
+		}
+
+		stats.root_type = coltype;
+
+		// Push the columns stats into the datafile
+		data_file.column_stats.push_back({std::move(column_names), std::move(stats)});
+	}
+}
+
 static void AddWrittenFiles(DeltaInsertGlobalState &global_state, DataChunk &chunk) {
 	for (idx_t r = 0; r < chunk.size(); r++) {
 		DeltaDataFile data_file;
@@ -163,71 +227,11 @@ static void AddWrittenFiles(DeltaInsertGlobalState &global_state, DataChunk &chu
 		data_file.row_count = chunk.GetValue(1, r).GetValue<idx_t>();
 		data_file.file_size_bytes = chunk.GetValue(2, r).GetValue<idx_t>();
 		data_file.footer_size = chunk.GetValue(3, r).GetValue<idx_t>();
-		// extract the column stats
-		auto column_stats = chunk.GetValue(4, r);
-		auto &map_children = MapValue::GetChildren(column_stats);
 
 		global_state.insert_count += data_file.row_count;
 
-		for (idx_t col_idx = 0; col_idx < map_children.size(); col_idx++) {
-			auto &struct_children = StructValue::GetChildren(map_children[col_idx]);
-			auto &col_name = StringValue::Get(struct_children[0]);
-			auto &col_stats = MapValue::GetChildren(struct_children[1]);
-			auto column_names = ParseQuotedList(col_name, '.');
-			auto stats = ParseColumnStats(col_stats);
-
-			// The copy reports stats under the names it was given, which on a column-mapped table are the
-			// physical ones -- and that is also how the log wants them keyed, so they pass through untouched.
-			// Constraints and messages resolve on the logical name, which would otherwise miss silently and
-			// stop enforcing the constraint.
-			bool found = false;
-			LogicalType coltype;
-			string logical_name;
-			for (auto &col : global_state.columns) {
-				const auto &written_name = col.physical_name.empty() ? col.name.GetIdentifierName() : col.physical_name;
-				if (written_name == column_names[0]) {
-					found = true;
-					coltype = col.type;
-					logical_name = col.name.GetIdentifierName();
-					break;
-				}
-			}
-			if (!found) {
-				throw InternalException("Column %s not found in table %s", StringUtil::Join(column_names, "."),
-				                        global_state.table_name);
-			}
-
-			if (stats.has_null_count && stats.null_count > 0) {
-				auto constraint = global_state.not_null_constraints.find(logical_name);
-				if (constraint != global_state.not_null_constraints.end()) {
-					// We may have a not null constraint for this col, it's not nested so it
-					if (column_names.size() == 1) {
-						throw ConstraintException("NOT NULL constraint failed: %s.%s", global_state.table_name,
-						                          logical_name);
-					}
-
-					// Check paths
-					for (auto &constr : constraint->second) {
-						if (col_name == constr.path) {
-							auto logical_path = column_names;
-							logical_path[0] = logical_name;
-							throw ConstraintException("NOT NULL constraint failed: %s.%s", global_state.table_name,
-							                          StringUtil::Join(logical_path, "."));
-						}
-					}
-				}
-			}
-
-			// Skip types whose stats we don't yet support
-			if (coltype.id() == LogicalTypeId::VARIANT || coltype.id() == LogicalTypeId::LIST) {
-				continue;
-			}
-
-			stats.root_type = coltype;
-
-			// Push the columns stats into the datafile
-			data_file.column_stats.push_back({std::move(column_names), std::move(stats)});
-		}
+		ParseWrittenColumnStats(chunk.GetValue(4, r), global_state.columns, global_state.table_name,
+		                        global_state.not_null_constraints, data_file);
 
 		// extract the partition info
 		auto partition_info = chunk.GetValue(5, r);
