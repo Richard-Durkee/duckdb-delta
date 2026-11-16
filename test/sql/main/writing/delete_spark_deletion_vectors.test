@@ -1,0 +1,44 @@
+# name: test/sql/main/writing/delete_spark_deletion_vectors.test
+# description: DELETE from a table whose deletion vector Spark wrote
+# group: [writing]
+
+require parquet
+
+require delta
+
+require json
+
+require notwindows
+
+require-env DAT_PATH
+
+# Five rows in one data file, four of them deleted by a Spark deletion vector. read_blob reports a './' path without
+# the './', so it is removed for copy_dir to find the files' relative paths.
+statement ok
+FROM copy_dir(regexp_replace('{DAT_PATH}', '^\./', '') || '/out/reader_tests/generated/deletion_vectors/delta', '{TEMP_DIR}/delete_spark_dv');
+
+statement ok
+ATTACH '{TEMP_DIR}/delete_spark_dv' AS dv (TYPE delta);
+
+query II
+SELECT letter, int FROM dv;
+----
+b	228
+
+query I
+DELETE FROM dv WHERE letter = 'b';
+----
+1
+
+query I
+SELECT count(*) FROM dv;
+----
+0
+
+# The Spark-written file's new deletion vector holds Spark's four rows and the one deleted here
+query I
+SELECT list(add.deletionVector.cardinality ORDER BY add.deletionVector.cardinality)
+FROM read_json('{TEMP_DIR}/delete_spark_dv/_delta_log/*.json', filename = true)
+WHERE add IS NOT NULL AND filename = (SELECT max(file) FROM glob('{TEMP_DIR}/delete_spark_dv/_delta_log/*.json'));
+----
+[5]

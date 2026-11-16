@@ -21,6 +21,7 @@
 #include "duckdb/main/client_context_file_opener.hpp"
 #include "functions/delta_scan/delta_scan.hpp"
 #include "storage/delta_insert.hpp"
+#include "storage/delta_deletion_vector.hpp"
 #include "duckdb/main/connection.hpp"
 #include "storage/delta_table_entry.hpp"
 #include "duckdb/common/file_system.hpp"
@@ -293,12 +294,16 @@ void DeltaTransaction::CleanUpFiles() {
 	// Clean up the files created by this transaction
 	auto context_ptr = context.lock();
 	if (context_ptr) {
+		auto &fs = FileSystem::GetFileSystem(*context_ptr);
 		for (const auto &append : outstanding_appends) {
-			auto &fs = FileSystem::GetFileSystem(*context_ptr);
 			fs.TryRemoveFile(append.file_name);
+		}
+		for (const auto &dv_file : outstanding_deletion_vector_files) {
+			fs.TryRemoveFile(dv_file);
 		}
 	}
 	outstanding_appends.clear();
+	outstanding_deletion_vector_files.clear();
 }
 
 ffi::OptionalValue<ffi::Handle<ffi::ExclusiveRustString>> DeltaTransaction::CommitCallback(ffi::NullableCvoid context,
@@ -408,7 +413,7 @@ void DeltaTransaction::Commit(ClientContext &context) {
 	if (transaction_state == DeltaTransactionState::TRANSACTION_STARTED) {
 		transaction_state = DeltaTransactionState::TRANSACTION_FINISHED;
 
-		if (!outstanding_appends.empty()) {
+		if (!outstanding_appends.empty() || !outstanding_deletion_vector_files.empty()) {
 			// Finally we add the registered transaction versions
 			for (const auto &app_version : app_versions) {
 				auto app_id = app_version.first;
@@ -511,7 +516,7 @@ ffi::Handle<ffi::MutableCommitter> DeltaTransaction::CreateCatalogCommitter(cons
 	return committer;
 }
 
-void DeltaTransaction::InitializeTransaction(ClientContext &context) {
+void DeltaTransaction::InitializeTransaction(ClientContext &context, ffi::KernelUpdateTableOperation operation) {
 	current_context = context.shared_from_this();
 
 	if (access_mode == AccessMode::READ_ONLY) {
@@ -539,11 +544,10 @@ void DeltaTransaction::InitializeTransaction(ClientContext &context) {
 			    path);
 		}
 
-		// Every write here appends to an existing table, so it is a WRITE that changes data.
+		// Every write here changes data: an INSERT appends rows, a DELETE removes them
 		string engine_info = "DuckDB";
 		auto builder = table_entry->snapshot->TryUnpackKernelResult(ffi::new_update_table_txn_builder(
-		    snapshot_ref.GetPtr(), ffi::KernelUpdateTableOperation::KernelUpdateTableOperationWrite,
-		    KernelUtils::ToDeltaString(engine_info), true, engine));
+		    snapshot_ref.GetPtr(), operation, KernelUtils::ToDeltaString(engine_info), true, engine));
 
 		if (parent_commit) {
 			// The committer is built after the builder, so a failure to build it has only the builder to free;
@@ -566,10 +570,14 @@ void DeltaTransaction::InitializeTransaction(ClientContext &context) {
 	write_entry = table_entry.get();
 }
 
-void DeltaTransaction::Append(ClientContext &context, const vector<DeltaDataFile> &append_files) {
+void DeltaTransaction::EnsureTransaction(ClientContext &context, ffi::KernelUpdateTableOperation operation) {
 	if (transaction_state == DeltaTransactionState::TRANSACTION_NOT_YET_STARTED) {
-		InitializeTransaction(context);
+		InitializeTransaction(context, operation);
 	}
+}
+
+void DeltaTransaction::Append(ClientContext &context, const vector<DeltaDataFile> &append_files) {
+	EnsureTransaction(context, ffi::KernelUpdateTableOperation::KernelUpdateTableOperationWrite);
 
 	idx_t start = outstanding_appends.size();
 
@@ -599,6 +607,49 @@ void DeltaTransaction::Append(ClientContext &context, const vector<DeltaDataFile
 	}
 }
 
+void DeltaTransaction::UpdateDeletionVectors(
+    ClientContext &context, const DeltaDeletionVectorFile &dv_file,
+    const vector<pair<string, DeltaDeletionVectorDescriptor>> &deletion_vectors) {
+	EnsureTransaction(context, ffi::KernelUpdateTableOperation::KernelUpdateTableOperationDelete);
+	// Recorded before the write, so a rollback removes a partly written file too
+	outstanding_deletion_vector_files.push_back(dv_file.GetPath());
+	dv_file.Write(FileSystem::GetFileSystem(context));
+
+	auto &snapshot = *table_entry->snapshot;
+	auto engine = snapshot.extern_engine.get();
+	auto dv_map = ffi::dv_descriptor_map_new();
+	for (auto &entry : deletion_vectors) {
+		auto &descriptor = entry.second;
+		ffi::Handle<ffi::ExclusiveDvDescriptor> dv_descriptor;
+		auto res = KernelUtils::TryUnpackResult(
+		    ffi::dv_descriptor_new(DeltaDeletionVectorDescriptor::STORAGE_TYPE_PERSISTED_RELATIVE,
+		                           KernelUtils::ToDeltaString(descriptor.path_or_inline_dv), true, descriptor.offset,
+		                           descriptor.size_in_bytes, descriptor.cardinality, engine),
+		    dv_descriptor);
+		bool inserted = false;
+		if (!res.HasError()) {
+			// Consumes the descriptor, on error too
+			res = KernelUtils::TryUnpackResult(
+			    ffi::dv_descriptor_map_insert(dv_map, KernelUtils::ToDeltaString(entry.first), dv_descriptor, engine),
+			    inserted);
+		}
+		if (res.HasError()) {
+			ffi::free_dv_descriptor_map(dv_map);
+			res.Throw();
+		}
+	}
+	// Kernel matches each descriptor to its file by the file's scan row, and keeps that row's stats and partition
+	// values in the add action it writes with the new deletion vector. Consumes the map and the scan, on error too.
+	auto scan = snapshot.ScanAllFiles();
+	bool updated = false;
+	auto res = KernelUtils::TryUnpackResult(
+	    ffi::update_table_txn_update_deletion_vectors(kernel_transaction.get(), dv_map, scan.release(), engine),
+	    updated);
+	if (res.HasError()) {
+		res.Throw();
+	}
+}
+
 void DeltaTransaction::SetTransactionVersion(const string &app_id_p, idx_t new_version_p, Value expected_version_p) {
 	app_versions.insert({app_id_p, {new_version_p, std::move(expected_version_p)}});
 }
@@ -611,9 +662,9 @@ AccessMode DeltaTransaction::GetAccessMode() const {
 	return access_mode;
 }
 
-bool DeltaTransaction::HasOutstandingAppends() const {
+bool DeltaTransaction::HasOutstandingWrites() const {
 	unique_lock<mutex> lck(lock);
-	return !outstanding_appends.empty();
+	return !outstanding_appends.empty() || !outstanding_deletion_vector_files.empty();
 }
 
 optional_ptr<DeltaTableEntry> DeltaTransaction::GetTableEntry(idx_t version) {

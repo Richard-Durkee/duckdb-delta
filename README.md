@@ -109,6 +109,7 @@ regular parquet scanning logic:
   - skipping complete files (based on delta partition info)
 - projection pushdown
 - blind inserts
+- DELETE on tables that enable deletion vectors
 - time travel by version or timestamp
 - scanning tables with deletion vectors
 - all primitive types

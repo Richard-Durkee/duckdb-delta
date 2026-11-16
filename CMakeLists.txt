@@ -31,6 +31,8 @@ set(EXTENSION_SOURCES
     src/functions/delta_transaction_utils/idempotency_helpers.cpp
     src/path_utils.cpp
     src/storage/delta_insert.cpp
+    src/storage/delta_delete.cpp
+    src/storage/delta_deletion_vector.cpp
     src/storage/delta_catalog.cpp
     src/storage/delta_create_table.cpp
     src/storage/delta_schema_entry.cpp

@@ -11,6 +11,7 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "functions/delta_scan/delta_multi_file_list.hpp"
+#include "duckdb/common/multi_file/multi_file_reader.hpp"
 
 namespace duckdb {
 
@@ -29,9 +30,34 @@ unique_ptr<BaseStatistics> DeltaTableEntry::GetStatistics(ClientContext &context
 	return nullptr;
 }
 
+virtual_column_map_t DeltaTableEntry::GetVirtualColumns() const {
+	auto result = TableCatalogEntry::GetVirtualColumns();
+	result.insert(
+	    make_pair(MultiFileReader::COLUMN_IDENTIFIER_FILENAME, TableColumn("filename", LogicalType::VARCHAR)));
+	result.insert(make_pair(MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER,
+	                        TableColumn("file_row_number", LogicalType::BIGINT)));
+	return result;
+}
+
+vector<column_t> DeltaTableEntry::GetRowIdColumns() const {
+	return {MultiFileReader::COLUMN_IDENTIFIER_FILENAME, MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER};
+}
+
+void DeltaTableEntry::ThrowOnUnsupportedDelete() const {
+	auto &table_name = name.GetIdentifierName();
+	if (!snapshot->HasWriterFeature("deletionVectors") ||
+	    !snapshot->TablePropertyIsTrue("delta.enableDeletionVectors")) {
+		throw NotImplementedException(
+		    "DELETE from Delta table \"%s\" is not supported: it does not enable deletion vectors, and rewriting its "
+		    "data files instead is not implemented yet. A table created with 'delta.enableDeletionVectors' = 'true' "
+		    "supports DELETE.",
+		    table_name);
+	}
+}
+
 void DeltaTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &, LogicalProjection &, LogicalUpdate &,
                                             ClientContext &) {
-	throw NotImplementedException("BindUpdateConstraints for delta table");
+	throw NotImplementedException("UPDATE on a Delta table is not supported yet");
 }
 
 TableFunction DeltaTableEntry::GetScanFunctionInternal(ClientContext &context, unique_ptr<FunctionData> &bind_data,
@@ -52,7 +78,7 @@ TableFunction DeltaTableEntry::GetScanFunctionInternal(ClientContext &context, u
 	auto &delta_catalog = catalog.Cast<DeltaCatalog>();
 
 	auto &transaction = DeltaTransaction::Get(context, delta_catalog);
-	if (transaction.HasOutstandingAppends()) {
+	if (transaction.HasOutstandingWrites()) {
 		throw CatalogException("Scanning a table with uncommitted writes is not supported");
 	}
 
@@ -73,6 +99,7 @@ TableFunction DeltaTableEntry::GetScanFunctionInternal(ClientContext &context, u
 
 	function_info->snapshot = this->snapshot;
 	function_info->table_name = delta_catalog.GetName().GetIdentifierName();
+	function_info->table_entry = this;
 	delta_scan_function.function_info = std::move(function_info);
 
 	vector<Value> inputs = {delta_catalog.GetDBPath()};

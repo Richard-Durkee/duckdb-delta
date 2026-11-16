@@ -71,6 +71,8 @@ struct DeltaMultiFileReader : public MultiFileReader {
 	// A snapshot can be injected into the multifilereader, this ensures the GetMultiFileList can return this snapshot
 	// (note that the path should match the one passed to CreateFileList)
 	shared_ptr<DeltaMultiFileList> snapshot;
+	//! The catalog table the injected snapshot belongs to, see DeltaFunctionInfo::table_entry
+	optional_ptr<TableCatalogEntry> table_entry;
 	// Time travel requested via the `version` or `timestamp` named parameter, captured in ParseOption.
 	// Transferred to the snapshot before Bind (see DeltaMultiFileReader::Bind) when no snapshot was
 	// injected via function_info.

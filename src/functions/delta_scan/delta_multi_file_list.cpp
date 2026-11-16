@@ -556,21 +556,8 @@ void ScanDataCallBack::VisitCallbackInternal(ffi::NullableCvoid engine_context, 
 	auto context = (ScanDataCallBack *)engine_context;
 	auto &snapshot = context->snapshot;
 
-	auto path_string = snapshot.GetPath();
-	auto sub_path = KernelUtils::FromDeltaString(path);
-	// add.path is relative to the table root, or an absolute path or URI (e.g. shallow clones, #74). "file:/abs" (no
-	// "//") is the Hadoop spelling of a local absolute path.
-	if ((StringUtil::StartsWith(sub_path, "/") && sub_path.find('/', 1) != std::string::npos) ||
-	    HasUriScheme(sub_path) || StringUtil::StartsWith(sub_path, "file:/")) {
-		path_string = sub_path;
-	} else {
-		StringUtil::RTrim(path_string, "/");
-		path_string += "/" + sub_path;
-	}
-	path_string = url_decode(path_string);
-
 	// First we append the file to our resolved files
-	snapshot.resolved_files.emplace_back(DeltaMultiFileList::ToDuckDBPath(path_string));
+	snapshot.resolved_files.emplace_back(snapshot.ResolveDataFilePath(KernelUtils::FromDeltaString(path)));
 	snapshot.metadata.emplace_back(make_uniq<DeltaFileMetaData>());
 
 	D_ASSERT(snapshot.resolved_files.size() == snapshot.metadata.size());
@@ -682,6 +669,20 @@ DeltaMultiFileList::DeltaMultiFileList(ClientContext &context_p, const string &p
 
 string DeltaMultiFileList::GetPath() const {
 	return paths[0].path;
+}
+
+string DeltaMultiFileList::ResolveDataFilePath(const string &add_path) const {
+	auto path_string = GetPath();
+	// add.path is relative to the table root, or an absolute path or URI (e.g. shallow clones, #74). "file:/abs" (no
+	// "//") is the Hadoop spelling of a local absolute path.
+	if ((StringUtil::StartsWith(add_path, "/") && add_path.find('/', 1) != std::string::npos) ||
+	    HasUriScheme(add_path) || StringUtil::StartsWith(add_path, "file:/")) {
+		path_string = add_path;
+	} else {
+		StringUtil::RTrim(path_string, "/");
+		path_string += "/" + add_path;
+	}
+	return ToDuckDBPath(url_decode(path_string));
 }
 
 string DeltaMultiFileList::ToDuckDBPath(const string &raw_path) {
@@ -1517,6 +1518,117 @@ bool DeltaMultiFileList::ResolvesByFieldId() const {
 	unique_lock<mutex> lck(lock);
 	EnsureScanInitialized();
 	return resolve_by_field_id;
+}
+
+bool DeltaMultiFileList::HasWriterFeature(const string &feature) const {
+	unique_lock<mutex> lck(lock);
+	EnsureSnapshotInitialized();
+	auto snapshot_ref = snapshot->GetLockingRef();
+	return KernelUtils::HasWriterFeature(snapshot_ref.GetPtr(), feature);
+}
+
+bool DeltaMultiFileList::TablePropertyIsTrue(const string &key) const {
+	unique_lock<mutex> lck(lock);
+	EnsureSnapshotInitialized();
+	auto snapshot_ref = snapshot->GetLockingRef();
+	return StringUtil::CIEquals(KernelUtils::ReadTableProperty(snapshot_ref.GetPtr(), key), "true");
+}
+
+KernelScanDataIterator DeltaMultiFileList::ScanAllFiles() const {
+	unique_lock<mutex> lck(lock);
+	EnsureSnapshotInitialized();
+	auto snapshot_ref = snapshot->GetLockingRef();
+	KernelScan all_files_scan(
+	    TryUnpackKernelResult(ffi::scan(snapshot_ref.GetPtr(), extern_engine.get(), nullptr, nullptr)));
+	return KernelScanDataIterator(
+	    TryUnpackKernelResult(ffi::scan_metadata_iter_init(extern_engine.get(), all_files_scan.get())));
+}
+
+namespace {
+//! Collects the files of a scan that GetLoggedDataFiles asks for
+struct LoggedDataFileVisitor {
+	const DeltaMultiFileList &list;
+	const unordered_set<string> &paths;
+	string table_root;
+	unordered_map<string, DeltaLoggedDataFile> result;
+	ErrorData error;
+
+	static void VisitData(ffi::NullableCvoid engine_context, ffi::Handle<ffi::SharedScanMetadata> scan_metadata_raw) {
+		KernelScanMetadata scan_metadata(scan_metadata_raw);
+		auto &visitor = *static_cast<LoggedDataFileVisitor *>(engine_context);
+		bool ok;
+		auto res = KernelUtils::TryUnpackResult(
+		    ffi::visit_scan_metadata(scan_metadata.get(), visitor.list.extern_engine.get(), engine_context, VisitFile),
+		    ok);
+		if (res.HasError()) {
+			visitor.error = res;
+		}
+	}
+
+	static void VisitFile(ffi::NullableCvoid engine_context, ffi::KernelStringSlice path, int64_t, int64_t,
+	                      const ffi::Stats *, const ffi::CDvInfo *dv_info, const ffi::Expression *,
+	                      const ffi::CStringMap *) {
+		auto &visitor = *static_cast<LoggedDataFileVisitor *>(engine_context);
+		try {
+			auto add_path = KernelUtils::FromDeltaString(path);
+			auto resolved = visitor.list.ResolveDataFilePath(add_path);
+			if (!visitor.paths.count(resolved)) {
+				return;
+			}
+			auto &file = visitor.result[resolved];
+			file.add_path = std::move(add_path);
+			if (!dv_info->has_vector) {
+				return;
+			}
+			ffi::KernelRowIndexArray row_indexes;
+			auto res =
+			    KernelUtils::TryUnpackResult(ffi::row_indexes_from_dv(dv_info->info, visitor.list.extern_engine.get(),
+			                                                          KernelUtils::ToDeltaString(visitor.table_root)),
+			                                 row_indexes);
+			if (res.HasError()) {
+				visitor.error = res;
+				return;
+			}
+			file.deleted_rows.assign(row_indexes.ptr, row_indexes.ptr + row_indexes.len);
+			ffi::free_row_indexes(row_indexes);
+			// Kernel returns the rows in order, which the merge with the new rows relies on
+			D_ASSERT(std::is_sorted(file.deleted_rows.begin(), file.deleted_rows.end()));
+		} catch (std::exception &e) {
+			visitor.error = ErrorData(e);
+		}
+	}
+};
+} // namespace
+
+unordered_map<string, DeltaLoggedDataFile>
+DeltaMultiFileList::GetLoggedDataFiles(const unordered_set<string> &paths) const {
+	string table_root;
+	{
+		unique_lock<mutex> lck(lock);
+		EnsureSnapshotInitialized();
+		auto snapshot_ref = snapshot->GetLockingRef();
+		auto root =
+		    static_cast<string *>(ffi::snapshot_table_root(snapshot_ref.GetPtr(), KernelUtils::StringAllocationNew));
+		table_root = *root;
+		delete root;
+	}
+	auto iterator = ScanAllFiles();
+	LoggedDataFileVisitor visitor {*this, paths, table_root, {}, ErrorData()};
+	while (true) {
+		bool have_scan_data;
+		auto res = KernelUtils::TryUnpackResult<bool>(
+		    ffi::scan_metadata_next(iterator.get(), &visitor, LoggedDataFileVisitor::VisitData), have_scan_data);
+		if (visitor.error.HasError()) {
+			visitor.error.Throw();
+		}
+		if (res.HasError()) {
+			res.Throw();
+		}
+		if (!have_scan_data) {
+			break;
+		}
+	}
+	return std::move(visitor.result);
 }
 
 } // namespace duckdb

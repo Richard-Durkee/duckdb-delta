@@ -205,9 +205,10 @@ PhysicalOperator &DeltaCatalog::PlanCreateTableAs(ClientContext &context, Physic
 	return DeltaInsert::PlanCreateTableAs(context, planner, plan, std::move(request), "Delta CREATE TABLE AS",
 	                                      op.estimated_cardinality, committer);
 }
-PhysicalOperator &DeltaCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
-                                           PhysicalOperator &plan) {
-	throw NotImplementedException("DeltaCatalog PlanDelete");
+PhysicalOperator &DeltaCatalog::PlanMergeInto(ClientContext &context, PhysicalPlanGenerator &planner,
+                                              LogicalMergeInto &op, PhysicalOperator &plan) {
+	// MERGE binds because the scan reports its table, but its actions are not supported yet
+	throw NotImplementedException("MERGE INTO a Delta table is not supported yet");
 }
 PhysicalOperator &DeltaCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
                                            PhysicalOperator &plan) {

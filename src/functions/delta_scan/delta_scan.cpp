@@ -56,6 +56,13 @@ static InsertionOrderPreservingMap<string> DeltaFunctionToString(TableFunctionTo
 	return result;
 }
 
+//! The catalog table this scan reads, which the binder needs to plan a DELETE. It is kept on the multi-file reader
+//! because each bind creates its own reader, while the snapshot may be shared between transactions.
+static optional_ptr<TableCatalogEntry> DeltaGetTableEntry(optional_ptr<const FunctionData> bind_data) {
+	auto &multi_file_data = bind_data->Cast<MultiFileBindData>();
+	return multi_file_data.multi_file_reader->Cast<DeltaMultiFileReader>().table_entry;
+}
+
 virtual_column_map_t DeltaVirtualColumns(ClientContext &, optional_ptr<FunctionData> bind_data_p) {
 	virtual_column_map_t result;
 	result.insert(
@@ -114,6 +121,7 @@ TableFunctionSet DeltaFunctions::GetDeltaScanFunction(ExtensionLoader &loader) {
 		function.statistics = nullptr;
 		function.table_scan_progress = nullptr;
 		function.get_bind_info = nullptr;
+		function.get_table_entry = DeltaGetTableEntry;
 		function.get_virtual_columns = DeltaVirtualColumns;
 		function.supports_pushdown_extract = DeltaScanSupportsPushdownExtract;
 		function.late_materialization = false;

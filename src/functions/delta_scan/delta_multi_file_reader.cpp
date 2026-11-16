@@ -111,7 +111,9 @@ unique_ptr<MultiFileReader> DeltaMultiFileReader::CreateInstance(const BoundTabl
 	auto result = make_uniq<DeltaMultiFileReader>();
 
 	if (table_function.function_info) {
-		result->snapshot = table_function.function_info->Cast<DeltaFunctionInfo>().snapshot;
+		auto &function_info = table_function.function_info->Cast<DeltaFunctionInfo>();
+		result->snapshot = function_info.snapshot;
+		result->table_entry = function_info.table_entry;
 	}
 
 	return std::move(result);

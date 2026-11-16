@@ -36,8 +36,15 @@ public:
 	void BindUpdateConstraints(Binder &binder, LogicalGet &get, LogicalProjection &proj, LogicalUpdate &update,
 	                           ClientContext &context) override;
 
+	//! Rows are identified by their data file and their position in that file, which is what a deletion vector records
+	virtual_column_map_t GetVirtualColumns() const override;
+	vector<column_t> GetRowIdColumns() const override;
+
 	case_insensitive_map_t<vector<NestedNotNullConstraint>> GetNotNullConstraints() const;
 	void ThrowOnUnsupportedFieldForInserting() const;
+	//! Refuses a DELETE on a table without deletion vectors, before any row is read. Kernel refuses the table features
+	//! a DELETE must respect, such as append-only tables, when the transaction commits.
+	void ThrowOnUnsupportedDelete() const;
 
 public:
 	shared_ptr<DeltaMultiFileList> snapshot;

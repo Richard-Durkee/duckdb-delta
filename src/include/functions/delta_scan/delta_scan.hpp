@@ -31,6 +31,8 @@ struct DeltaFunctionInfo : public TableFunctionInfo {
 	shared_ptr<DeltaMultiFileList> snapshot;
 	string expected_path;
 	string table_name;
+	//! The catalog table this scan reads, which DELETE resolves its target from. Null for a delta_scan('path').
+	optional_ptr<TableCatalogEntry> table_entry;
 };
 
 } // namespace duckdb

@@ -70,12 +70,12 @@ COPY with_default FROM '{TEMP_DIR}/column_defaults/row.csv';
 ----
 Not implemented Error: Delta table "with_default" uses the 'allowColumnDefaults' writer feature
 
-# MERGE does not reach the Delta insert yet; once it does, its INSERT action must be refused like INSERT
+# MERGE is refused before it reaches the Delta insert; once it does, its INSERT action must be refused like INSERT
 statement error
 MERGE INTO with_default USING (SELECT 2 AS id) AS src ON with_default.id = src.id
 WHEN NOT MATCHED THEN INSERT (id) VALUES (src.id);
 ----
-Binder Error: Can only merge into base tables!
+Not implemented Error: MERGE INTO a Delta table is not supported yet
 
 # The feature alone is enough: Spark may add a default to any column later
 statement error

@@ -49,6 +49,14 @@ struct DeltaFileMetaData {
 	unique_ptr<vector<unique_ptr<ParsedExpression>>> transform_expression;
 };
 
+//! A data file of the snapshot, as needed to give it a new deletion vector
+struct DeltaLoggedDataFile {
+	//! The `path` of the file's add action, which kernel uses to identify the file
+	string add_path;
+	//! The rows the file's current deletion vector deletes, in order
+	vector<idx_t> deleted_rows;
+};
+
 struct DeltaTableFilters {
 	using filter_set_t = unordered_map<idx_t, unique_ptr<ExpressionFilter>>;
 	using iterator = filter_set_t::iterator;
@@ -157,6 +165,18 @@ public:
 	//! The table's column mapping mode is `name` or `id`, with the protocol feature that makes it count. Initializes
 	//! the snapshot.
 	bool UsesColumnMapping() const;
+	//! The protocol lists `feature` among its writer features
+	bool HasWriterFeature(const string &feature) const;
+	//! Whether the table property `key` is set to true, compared case-insensitively like Spark does
+	bool TablePropertyIsTrue(const string &key) const;
+
+	//! The path the scan reads the data file at, from the `path` of the add action that adds it
+	string ResolveDataFilePath(const string &add_path) const;
+	//! The data files the scan read at `paths`, each with the add path kernel matches it by and the rows its current
+	//! deletion vector deletes. Reads the deletion vectors of these files only.
+	unordered_map<string, DeltaLoggedDataFile> GetLoggedDataFiles(const unordered_set<string> &paths) const;
+	//! A new kernel scan over every file of the snapshot, for kernel calls that match files by their scan rows
+	KernelScanDataIterator ScanAllFiles() const;
 
 protected:
 	//! Get the i-th expanded file

@@ -1,0 +1,374 @@
+# name: test/sql/main/writing/delete.test
+# description: DELETE from a Delta table with deletion vectors
+# group: [writing]
+
+require parquet
+
+require delta
+
+require json
+
+require notwindows
+
+# -----------------------------------------------------------------------------
+# setup: two data files of ten rows each
+#
+
+statement ok
+ATTACH '{TEMP_DIR}/main/writing/delete/t' AS t (TYPE delta);
+
+statement ok
+CREATE TABLE t.t (i INTEGER, s VARCHAR) WITH ('delta.enableDeletionVectors' = 'true');
+
+statement ok
+INSERT INTO t.t SELECT i, 'v' || i FROM range(10) r(i);
+
+statement ok
+INSERT INTO t.t SELECT i, 'v' || i FROM range(10, 20) r(i);
+
+# -----------------------------------------------------------------------------
+# test: a DELETE removes rows from both files and reports how many
+#
+
+query I
+DELETE FROM t.t WHERE i % 3 = 0;
+----
+7
+
+query II
+SELECT count(*), sum(i) FROM t.t;
+----
+13	127
+
+# The data files stay; the commit adds a deletion vector file
+query II
+SELECT (SELECT count(*) FROM glob('{TEMP_DIR}/main/writing/delete/t/*.parquet')),
+       (SELECT count(*) FROM glob('{TEMP_DIR}/main/writing/delete/t/deletion_vector_*.bin'));
+----
+2	1
+
+# The log replaces each file with itself and its deletion vector
+query IIII
+SELECT count(*) FILTER (WHERE add IS NOT NULL), count(*) FILTER (WHERE remove IS NOT NULL),
+       sum(add.deletionVector.cardinality), any_value(commitInfo.operation)
+FROM read_json('{TEMP_DIR}/main/writing/delete/t/_delta_log/00000000000000000003.json');
+----
+2	2	7	DELETE
+
+# -----------------------------------------------------------------------------
+# test: a second DELETE merges its rows with the files' current deletion vectors
+#
+
+query I
+DELETE FROM t.t WHERE i = 4 OR i = 17 OR i = 3;
+----
+2
+
+query II
+SELECT count(*), sum(i) FROM t.t;
+----
+11	106
+
+query I
+SELECT sum(add.deletionVector.cardinality)
+FROM read_json('{TEMP_DIR}/main/writing/delete/t/_delta_log/00000000000000000004.json');
+----
+9
+
+query II
+SELECT count(*), sum(i) FROM delta_scan('{TEMP_DIR}/main/writing/delete/t');
+----
+11	106
+
+# -----------------------------------------------------------------------------
+# test: a DELETE that matches nothing commits nothing
+#
+
+query I
+DELETE FROM t.t WHERE i > 100;
+----
+0
+
+query I
+SELECT count(*) FROM glob('{TEMP_DIR}/main/writing/delete/t/_delta_log/*.json');
+----
+5
+
+query I
+SELECT count(*) FROM glob('{TEMP_DIR}/main/writing/delete/t/deletion_vector_*.bin');
+----
+2
+
+# -----------------------------------------------------------------------------
+# test: deleting every row leaves each file with a deletion vector of all its rows
+#
+
+query I
+DELETE FROM t.t;
+----
+11
+
+query I
+SELECT count(*) FROM t.t;
+----
+0
+
+statement ok
+INSERT INTO t.t VALUES (42, 'x');
+
+query II
+SELECT i, s FROM t.t;
+----
+42	x
+
+# -----------------------------------------------------------------------------
+# test: DELETE ... USING matches a row once however many rows it joins
+#
+
+statement ok
+INSERT INTO t.t SELECT i, 'u' || i FROM range(5) r(i);
+
+statement ok
+CREATE TABLE to_delete AS SELECT * FROM (VALUES (1), (1), (3), (3), (3)) v(i);
+
+query I
+DELETE FROM t.t USING to_delete WHERE t.t.i = to_delete.i;
+----
+2
+
+query I
+SELECT list(i ORDER BY i) FROM t.t;
+----
+[0, 2, 4, 42]
+
+# -----------------------------------------------------------------------------
+# test: transactions
+#
+
+statement ok
+BEGIN
+
+query I
+DELETE FROM t.t WHERE i = 0;
+----
+1
+
+statement ok
+ROLLBACK
+
+query I
+SELECT list(i ORDER BY i) FROM t.t;
+----
+[0, 2, 4, 42]
+
+# A rolled back DELETE leaves no deletion vector file behind
+query I
+SELECT count(*) FROM glob('{TEMP_DIR}/main/writing/delete/t/deletion_vector_*.bin');
+----
+4
+
+statement ok
+BEGIN
+
+statement ok
+DELETE FROM t.t WHERE i = 0;
+
+# A second scan would not see the first DELETE
+statement error
+DELETE FROM t.t WHERE i = 2;
+----
+Scanning a table with uncommitted writes is not supported
+
+statement ok
+ROLLBACK
+
+# A DELETE and an INSERT commit together
+statement ok
+BEGIN
+
+statement ok
+DELETE FROM t.t WHERE i = 0;
+
+statement ok
+INSERT INTO t.t VALUES (7, 'y');
+
+statement ok
+COMMIT
+
+query I
+SELECT list(i ORDER BY i) FROM t.t;
+----
+[2, 4, 7, 42]
+
+# -----------------------------------------------------------------------------
+# test: containers of exactly 4096 rows (the largest array) and 4097 rows (the smallest bitmap)
+#
+
+statement ok
+ATTACH '{TEMP_DIR}/main/writing/delete/edge' AS edge (TYPE delta);
+
+statement ok
+CREATE TABLE edge.edge (i BIGINT) WITH ('delta.enableDeletionVectors' = 'true');
+
+statement ok
+INSERT INTO edge.edge SELECT i FROM range(140000) r(i);
+
+query I
+DELETE FROM edge.edge WHERE i < 4096 OR i BETWEEN 65536 AND 65536 + 4096;
+----
+8193
+
+query II
+SELECT count(*), min(i) FROM edge.edge;
+----
+131807	4096
+
+query I
+DELETE FROM edge.edge WHERE i = 4096 OR i = 139999;
+----
+2
+
+query III
+SELECT count(*), min(i), max(i) FROM edge.edge;
+----
+131805	4097	139998
+
+# -----------------------------------------------------------------------------
+# test: partition values and a table path with characters that need escaping
+#
+
+statement ok
+ATTACH '{TEMP_DIR}/main/writing/delete/odd path' AS odd (TYPE delta);
+
+statement ok
+CREATE TABLE odd.odd (i INTEGER, p VARCHAR) PARTITIONED BY (p) WITH ('delta.enableDeletionVectors' = 'true');
+
+statement ok
+INSERT INTO odd.odd SELECT i, p FROM range(4) r(i), (VALUES ('a b'), ('x%y'), ('k=v'), ('c:d'), ('é')) v(p);
+
+query I
+DELETE FROM odd.odd WHERE i = 1 OR p = 'x%y' AND i = 2;
+----
+6
+
+query II
+SELECT p, list(i ORDER BY i) FROM odd.odd GROUP BY p ORDER BY p;
+----
+a b	[0, 2, 3]
+c:d	[0, 2, 3]
+k=v	[0, 2, 3]
+x%y	[0, 3]
+é	[0, 2, 3]
+
+# -----------------------------------------------------------------------------
+# test: a seeded random engine does not make two DELETEs reuse a deletion vector file name
+#
+
+statement ok
+SELECT setseed(0.5);
+
+statement ok
+DELETE FROM edge.edge WHERE i = 5000;
+
+statement ok
+SELECT setseed(0.5);
+
+statement ok
+DELETE FROM edge.edge WHERE i = 5001;
+
+query II
+SELECT count(*), min(i) FROM edge.edge WHERE i BETWEEN 4999 AND 5002;
+----
+2	4999
+
+# -----------------------------------------------------------------------------
+# test: what DELETE refuses
+#
+
+statement ok
+ATTACH '{TEMP_DIR}/main/writing/delete/plain' AS plain (TYPE delta);
+
+statement ok
+CREATE TABLE plain.plain (i INTEGER);
+
+statement ok
+INSERT INTO plain.plain VALUES (1), (2);
+
+statement error
+DELETE FROM plain.plain WHERE i = 1;
+----
+it does not enable deletion vectors
+
+statement ok
+ATTACH '{TEMP_DIR}/main/writing/delete/cdf' AS cdf (TYPE delta);
+
+statement ok
+CREATE TABLE cdf.cdf (i INTEGER) WITH ('delta.enableDeletionVectors' = 'true', 'delta.enableChangeDataFeed' = 'true');
+
+statement ok
+INSERT INTO cdf.cdf VALUES (1), (2);
+
+# Readers derive the deleted rows' change data from the deletion vectors, as for Spark's DELETE
+query I
+DELETE FROM cdf.cdf WHERE i = 1;
+----
+1
+
+query I
+SELECT list(i) FROM cdf.cdf;
+----
+[2]
+
+statement ok
+ATTACH '{TEMP_DIR}/main/writing/delete/append_only' AS append_only (TYPE delta);
+
+statement ok
+CREATE TABLE append_only.append_only (i INTEGER) WITH ('delta.enableDeletionVectors' = 'true', 'delta.appendOnly' = 'true');
+
+statement ok
+INSERT INTO append_only.append_only VALUES (1), (2);
+
+statement error
+DELETE FROM append_only.append_only WHERE i = 1;
+----
+Append-only tables cannot remove files or update deletion vectors
+
+statement ok
+ATTACH '{TEMP_DIR}/main/writing/delete/row_tracking' AS row_tracking (TYPE delta);
+
+statement ok
+CREATE TABLE row_tracking.row_tracking (i INTEGER) WITH ('delta.enableDeletionVectors' = 'true', 'delta.enableRowTracking' = 'true');
+
+statement ok
+INSERT INTO row_tracking.row_tracking VALUES (1), (2);
+
+statement error
+DELETE FROM row_tracking.row_tracking WHERE i = 1;
+----
+Data manipulation on a table with Row Tracking enabled requires preserving stable Row IDs
+
+# Kernel refuses both at commit, and the rollback removes the deletion vector files they wrote
+query II
+SELECT (SELECT count(*) FROM glob('{TEMP_DIR}/main/writing/delete/append_only/deletion_vector_*.bin')),
+       (SELECT count(*) FROM glob('{TEMP_DIR}/main/writing/delete/row_tracking/deletion_vector_*.bin'));
+----
+0	0
+
+statement error
+DELETE FROM t.t WHERE i = 0 RETURNING i;
+----
+RETURNING clause not yet supported for deletion from a Delta table
+
+# UPDATE is refused, as the scan reporting its table lets it bind
+statement error
+UPDATE t.t SET i = 1;
+----
+UPDATE on a Delta table is not supported yet
+
+statement ok
+ATTACH '{TEMP_DIR}/main/writing/delete/t' AS pinned (TYPE delta, PIN_SNAPSHOT);
+
+statement error
+DELETE FROM pinned WHERE i = 0;
+----
+DELETE from a Delta table attached with PIN_SNAPSHOT is not supported

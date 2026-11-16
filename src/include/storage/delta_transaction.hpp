@@ -21,6 +21,8 @@ class DeltaMultiFileList;
 class TableFunctionCatalogEntry;
 struct DeltaDataFile;
 struct DeltaMultiFileColumnDefinition;
+struct DeltaDeletionVectorDescriptor;
+class DeltaDeletionVectorFile;
 
 enum class DeltaTransactionState { TRANSACTION_NOT_YET_STARTED, TRANSACTION_STARTED, TRANSACTION_FINISHED };
 
@@ -34,13 +36,19 @@ public:
 	void Rollback();
 
 	void Append(ClientContext &context, const vector<DeltaDataFile> &append_files);
+	//! Stages a DELETE. Writes `dv_file`, which holds a new deletion vector for each data file in `deletion_vectors`
+	//! (named by its add path). On commit, each replaces that file's current deletion vector. The transaction removes
+	//! the written file if it does not commit.
+	void UpdateDeletionVectors(ClientContext &context, const DeltaDeletionVectorFile &dv_file,
+	                           const vector<pair<string, DeltaDeletionVectorDescriptor>> &deletion_vectors);
 
 	void SetTransactionVersion(const string &app_id, idx_t new_version, Value expected_value);
 
 	static DeltaTransaction &Get(ClientContext &context, Catalog &catalog);
 	AccessMode GetAccessMode() const;
 
-	bool HasOutstandingAppends() const;
+	//! Whether this transaction has staged writes the table's snapshot does not show yet
+	bool HasOutstandingWrites() const;
 
 	optional_ptr<DeltaTableEntry> GetTableEntry(idx_t version);
 
@@ -50,7 +58,7 @@ public:
 	DeltaTableEntry &InitializeTableEntry(ClientContext &context, DeltaSchemaEntry &schema_entry, idx_t version,
 	                                      optional_ptr<const DeltaMultiFileList> old_snapshot);
 
-	//! Removes all outstanding appends and removes the files if possible
+	//! Removes all outstanding writes and the files they wrote, if possible
 	void CleanUpFiles();
 
 	//! CGetCommits callback for Unity Catalog managed commits
@@ -70,7 +78,10 @@ public:
 	}
 
 protected:
-	void InitializeTransaction(ClientContext &context);
+	//! Starts the kernel transaction, which records `operation` as the commit's operation
+	void InitializeTransaction(ClientContext &context, ffi::KernelUpdateTableOperation operation);
+	//! Starts the kernel transaction for `operation`, unless the transaction's first write started it already
+	void EnsureTransaction(ClientContext &context, ffi::KernelUpdateTableOperation operation);
 
 private:
 	mutable mutex lock;
@@ -92,6 +103,8 @@ private:
 	const AccessMode access_mode;
 
 	vector<DeltaDataFile> outstanding_appends;
+	//! Deletion vector files written for staged DELETEs
+	vector<string> outstanding_deletion_vector_files;
 
 	KernelExclusiveTransaction kernel_transaction;
 
